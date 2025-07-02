@@ -4,7 +4,6 @@ from functools import partial
 from torch.nn import LayerNorm
 
 
-
 class FeedForward(nn.Module):
     """
     A customizable MLP: you pass a list of hidden dims, and it'll
@@ -22,7 +21,7 @@ class FeedForward(nn.Module):
         self.LN = LayerNorm(normalized_shape=input_dim) # normalize just the 'D' part of the inputs...
         # Layer Norm!!
 
-        layers += self.LN # add an initial norm 
+        layers += [self.LN] # add an initial norm 
 
         for h in hidden_dims: # MLP
             layers += [
@@ -42,28 +41,4 @@ class FeedForward(nn.Module):
         '''
         x:  (batch, (N+1),D)
         '''
-        return self.feedForward(x) + x # add prev to preserve context
-
-
-class TransformerBlock(nn.Module):
-    """
-    One ViT block:
-       x → LN → MHA → +residual → LN → FeedForward → +residual
-    """
-    def __init__(self, dim, num_heads, ff_hidden_dims, drop=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn  = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=num_heads,
-            dropout=drop, batch_first=True
-        )
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff    = FeedForward(dim, ff_hidden_dims, drop=drop)
-
-    def forward(self, x):
-        # Self‐attention block
-        y, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
-        x = x + y
-        # Feed-forward block
-        x = x + self.ff(self.norm2(x))
-        return x
+        return self.LN(self.feedForward(x) + x) # add prev to preserve context
