@@ -3,7 +3,7 @@ import torch.nn as nn
 # from functools import partial
 from torch.nn import LayerNorm
 from torch import Tensor
-from .mlps.simpleMlp import FeedForward
+from ..mlps.simpleMlp import FeedForward
 
 class Encoder(nn.Module):
     """

@@ -3,7 +3,7 @@ import torch.nn as nn
 from functools import partial
 from torch.nn import LayerNorm
 
-from .encoders.pointVitEncod er import Encoder
+from .encoders.pointVitEncoder import Encoder
 from .voxelization.cloudVoxelizer import voxelize
 from .mlps.simpleMlp import FeedForward
 
@@ -26,6 +26,7 @@ class PointViT(nn.Module):
         # 1) Class token + positional embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dropout   = nn.Dropout(drop_rate)
+        self.positionEmbedder = 
 
         # 2) Stacked transformer blocks
         self.pipeline = []
@@ -39,7 +40,7 @@ class PointViT(nn.Module):
                 )
             ]
                 
-        self.pipeline += FeedForward(input_dim=voxel, hidden_dims, activation=nn.GELU, dropout=0.1)
+        self.pipeline += [FeedForward(input_dim=voxel, hidden_dims=ff_hidden_dims, activation=nn.GELU, dropout=0.1)]
 
         # 3) Final norm & head
         self.norm = nn.LayerNorm(embed_dim)
