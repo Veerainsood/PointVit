@@ -10,7 +10,7 @@ class SimpleCloudVoxelizer(Module):
             coors_range: Tensor,            # [xmin, ymin, zmin, xmax, ymax, zmax]
             device: torch.device,
             max_points_per_voxel: int = 32,
-            max_voxels: int = 2000
+            max_voxels: int = 100
     ):
         super().__init__
         self.voxel_size = voxel_size
@@ -18,67 +18,90 @@ class SimpleCloudVoxelizer(Module):
         self.max_points_per_voxel = max_points_per_voxel
         self.max_voxels = max_voxels
         self.device = device
+        self.grid_shape = ((self.coors_range[3:] - self.coors_range[:3]) / self.voxel_size).floor().long() 
 
-    def voxelize(
-            self,
-            points: torch.Tensor # [N, ≥3] (x,y,z[, ...features])
-        ):
-        '''
-        Args: 
-            points: (N,features)  where features >=3
-        Returns:
-            voxels: (max_voxels, max_points_per_voxel, eachPoint's Dimention)
-        '''
-        device = points.device
-        
-        grid_shape = (self.coors_range[3:] - self.coors_range[:3]) // self.voxel_size
+    def hybrid_voxel_selection(self,voxel_coords, counts):
+        """
+        voxel_coords: (M,3) ints
+        counts:       (M,)  point counts per voxel
+        returns:      idxs, a length-max_voxels list of selected indices
+        """
+        M = counts.shape[0]
+        P = int(0.6 * self.max_voxels)      # keep 60% densest
+        Q = self.max_voxels - P             # 40% by coverage
 
-        # map point to voxels.
-        voxel_indices = ( points - self.coors_range[:3] ) // self.voxel_size
+        # 1) densest
+        _, densest_idxs = torch.topk(counts, k=min(P, M), largest=True)
 
-        keys = voxel_indices[:,0] * grid_shape[1] * grid_shape[2] + voxel_indices[:,1] * grid_shape[2] + voxel_indices[:,2]
-        # mapping of each point to some number which can retrieve the 3D indexes in the plane to find out the exact location of the voxel.
+        # 2) farthest‐point sampling on the others
+        mask = torch.ones(M, dtype=torch.bool, device=counts.device)
+        mask[densest_idxs] = False
+        remaining = torch.nonzero(mask).squeeze(1)
 
-        # zaruri nahi hai ki har ek point har ek voxel me jaye to unique keys ko pick up karlo
-        unqique_keys , inverse_mapping , count = torch.unique(keys,device=device,return_inverse=True,return_counts=True)
+        centroids = (voxel_coords.float() * self.voxel_size + self.coors_range[:3])  # (M,3)
 
-        # unique keys can now give us the exact 3D positions of voxels present in the 3D plane which have at least 1 point
-        # voxel_index[i] = unique_keys[inverse_mapping[i],0] //grid_shape[1] * grid_shape[2] , unique_keys[inverse_mapping[i],1] // grid_shape[2], unique_keys[inverse_mapping[i],2] 
-        # this is how we get the 3d coordinate... of a point i....
+        def fps(points, K):
+            N = points.shape[0]
+            selected = [0]
+            dist = torch.full((N,), float('inf'), device=points.device)
+            for _ in range(1, min(K, N)):
+                last = points[selected[-1]][None]      # (1,3)
+                d = (points - last).pow(2).sum(dim=1)   # (N,)
+                dist = torch.min(dist, d)
+                selected.append(int(dist.argmax()))
+            return torch.tensor(selected, device=points.device)
 
-        # now choose only top k and drop all others.....
-        _, indexOfTopK = torch.topk(input=count,k=self.max_voxels,largest=True,sorted=True)
-        # JO BHI INDEX OF TOP K HAI VO VALE INDEXES COUNT KE CHOOSE HONGE,
-        # ONCE CHOSEN   THEN we can get unique voxels that are chosen out of this... how?
-        unqique_keys_v2 = unqique_keys[indexOfTopK]
+        rem_centroids = centroids[remaining]
+        fps_idxs = fps(rem_centroids, Q)
+        fps_global = remaining[fps_idxs]
 
-        newIndexMapper = -torch.ones_like(count, dtype=torch.long, device=device)
-        newIndexMapper[indexOfTopK] = torch.arange(indexOfTopK.numel(), device=device)
+        # 3) combine
+        selected = torch.cat([densest_idxs, fps_global])
+        return selected
 
-        voxels = torch.zeros((self.max_voxels,self.max_points_per_voxel,points.shape[1]),device=self.device)
-        num_per_voxel = torch.zeros((self.max_voxels,),dtype=torch.long, device=self.device)
-        voxel_coords = torch.zeros((self.max_voxels,3),device=self.device)
+    def voxelize(self, points: torch.Tensor):
+        # 1) compute per‐point voxel indices
+        voxel_idx = ((points - self.coors_range[:3]) / self.voxel_size).floor().long()
+        min_bound = torch.zeros_like(voxel_idx)
+        max_bound = (self.grid_shape - 1)[None, :].to(voxel_idx.device)
+        voxel_idx = torch.max(torch.min(voxel_idx, max_bound), min_bound)
+        keys = voxel_idx[:,0] * self.grid_shape[1] * self.grid_shape[2] + \
+            voxel_idx[:,1] * self.grid_shape[2] + \
+            voxel_idx[:,2]
 
-        topk_set = set(indexOfTopK.tolist())
-        
-        for i in range(points.shape[0]):
-            
-            unqique_keys_idx = int(inverse_mapping[i])
-            
-            if unqique_keys_idx in topk_set:
-                
-                zeroBasedIndex = newIndexMapper[unqique_keys_idx]
-                
-                key = unqique_keys_v2[unqique_keys_idx]
+        # 2) find unique voxels
+        unique_keys, inverse_map, counts = torch.unique(
+            keys, return_inverse=True, return_counts=True
+        )
+        M = unique_keys.numel()
 
-                iz =  key %  grid_shape[2]
-                iy = (key // grid_shape[2]) % grid_shape[1]
-                ix =  key // (grid_shape[1] * grid_shape[2])
+        # 3) recover their 3D coords
+        iz =  unique_keys %  self.grid_shape[2]
+        iy = (unique_keys // self.grid_shape[2]) % self.grid_shape[1]
+        ix =  unique_keys // (self.grid_shape[1] * self.grid_shape[2])
+        voxel_coords = torch.stack([ix, iy, iz], dim=1)   # (M,3)
 
-                voxel_coords[int(zeroBasedIndex)] = torch.tensor(( ix, iy, iz ),device=self.device)
-                
-                if num_per_voxel[zeroBasedIndex]< self.max_points_per_voxel :
-                    voxels[zeroBasedIndex, num_per_voxel[zeroBasedIndex]] = points[i]
-                    num_per_voxel[zeroBasedIndex]+=1
+        # 4) pick the best K voxels
+        selected = self.hybrid_voxel_selection(voxel_coords, counts)
+        K = selected.numel()
 
-        return voxels, voxel_coords, num_per_voxel
+        # 5) build a mapper from unique‐voxel‐idx → [0..K-1] or -1
+        newIndex = torch.full((M,), -1, dtype=torch.long, device=points.device)
+        newIndex[selected] = torch.arange(K, device=points.device)
+
+        # 6) prepare outputs
+        voxels = torch.zeros((K, self.max_points_per_voxel, points.shape[1]),
+                            device=points.device)
+        nums   = torch.zeros((K,), dtype=torch.long, device=points.device)
+        coords = torch.zeros((K,3), device=points.device)
+
+        # 7) scatter points into their selected voxel‐slots
+        for pt_i in range(points.shape[0]):
+            uv = inverse_map[pt_i].item()           # which unique‐voxel this pt falls into
+            slot = newIndex[uv].item()              # which output‐voxel slot (or -1)
+            if slot >= 0 and nums[slot] < self.max_points_per_voxel:
+                voxels[slot, nums[slot]] = points[pt_i]
+                nums[slot] += 1
+                coords[slot] = voxel_coords[uv]
+
+        return voxels, coords, nums
